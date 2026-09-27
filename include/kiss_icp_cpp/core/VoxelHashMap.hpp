@@ -49,6 +49,7 @@ struct VoxelHashMap {
     void RemovePointsFarFromLocation(const Eigen::Vector3d &origin);
     std::vector<Eigen::Vector3d> Pointcloud() const;
     std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(const Eigen::Vector3d &query) const;
+    std::vector<Eigen::Vector3d> Neighbors(const Eigen::Vector3d &query, int max_neighbors) const;
 
     double voxel_size_;
     double max_distance_;

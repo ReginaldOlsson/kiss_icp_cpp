@@ -20,6 +20,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include "kiss_icp_cpp/core/Registration.hpp"
+
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/global_control.h>
@@ -28,6 +30,7 @@
 #include <tbb/parallel_reduce.h>
 #include <tbb/task_arena.h>
 
+#include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -35,7 +38,6 @@
 #include <sophus/so3.hpp>
 #include <tuple>
 
-#include "kiss_icp_cpp/core/Registration.hpp"
 #include "kiss_icp_cpp/core/VoxelHashMap.hpp"
 #include "kiss_icp_cpp/core/VoxelUtils.hpp"
 
@@ -165,6 +167,134 @@ Sophus::SE3d Registration::AlignPointsToMap(const std::vector<Eigen::Vector3d> &
     }
     // Spit the final transformation
     return T_icp * initial_guess;
+}
+
+namespace {
+
+bool EstimatePlane(const std::vector<Eigen::Vector3d> &neighbors, Eigen::Vector3d &normal) {
+    constexpr int kMinNeighbors = 5;
+    if (static_cast<int>(neighbors.size()) < kMinNeighbors) {
+        return false;
+    }
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const auto &point : neighbors) {
+        mean += point;
+    }
+    mean /= static_cast<double>(neighbors.size());
+
+    Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+    for (const auto &point : neighbors) {
+        const Eigen::Vector3d delta = point - mean;
+        covariance += delta * delta.transpose();
+    }
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+    if (solver.info() != Eigen::Success) {
+        return false;
+    }
+    const double lambda_min = solver.eigenvalues()(0);
+    const double lambda_max = solver.eigenvalues()(2);
+    if (lambda_max <= 1e-8 || lambda_min / lambda_max > 0.25) {
+        return false;
+    }
+    normal = solver.eigenvectors().col(0);
+    if (normal.norm() < 1e-8) {
+        return false;
+    }
+    normal.normalize();
+    return true;
+}
+
+LinearSystem BuildPlaneLinearSystem(const std::vector<Eigen::Vector3d> &source,
+                                    const kiss_icp::VoxelHashMap &voxel_map,
+                                    const double max_distance,
+                                    const double kernel_scale,
+                                    int &correspondence_count) {
+    constexpr int kNeighborCount = 20;
+    LinearSystem system(Eigen::Matrix6d::Zero(), Eigen::Vector6d::Zero());
+    correspondence_count = 0;
+    const double kernel2 = square(kernel_scale);
+
+    for (const auto &point : source) {
+        const auto neighbors = voxel_map.Neighbors(point, kNeighborCount);
+        if (neighbors.empty()) {
+            continue;
+        }
+        const auto closest =
+            std::min_element(neighbors.cbegin(), neighbors.cend(),
+                             [&](const Eigen::Vector3d &lhs, const Eigen::Vector3d &rhs) {
+                                 return (lhs - point).squaredNorm() < (rhs - point).squaredNorm();
+                             });
+        const double distance = (*closest - point).norm();
+        if (distance >= max_distance) {
+            continue;
+        }
+
+        Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+        const bool planar = EstimatePlane(neighbors, normal);
+        ++correspondence_count;
+        if (planar) {
+            const double residual = normal.dot(point - *closest);
+            Eigen::Matrix<double, 1, 6> jacobian;
+            jacobian.block<1, 3>(0, 0) = normal.transpose();
+            jacobian.block<1, 3>(0, 3) = point.cross(normal).transpose();
+            const double weight = kernel2 / square(kernel_scale + residual * residual);
+            system.first += jacobian.transpose() * weight * jacobian;
+            system.second += jacobian.transpose() * weight * residual;
+        } else {
+            const Eigen::Vector3d residual = point - *closest;
+            Eigen::Matrix3_6d jacobian;
+            jacobian.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+            jacobian.block<3, 3>(0, 3) = -1.0 * Sophus::SO3d::hat(point);
+            const double weight = kernel2 / square(kernel_scale + residual.squaredNorm());
+            system.first += jacobian.transpose() * weight * jacobian;
+            system.second += jacobian.transpose() * weight * residual;
+        }
+    }
+    return system;
+}
+
+}  // namespace
+
+PlaneAlignResult Registration::AlignPointsToPlane(const std::vector<Eigen::Vector3d> &frame,
+                                                  const VoxelHashMap &voxel_map,
+                                                  const Sophus::SE3d &initial_guess,
+                                                  const double max_distance,
+                                                  const double kernel_scale,
+                                                  double &iteration_number) {
+    PlaneAlignResult result;
+    result.pose = initial_guess;
+    result.correction = Sophus::SE3d();
+    iteration_number = 0.0;
+    if (voxel_map.Empty() || frame.empty() || kernel_scale <= 0.0) {
+        return result;
+    }
+
+    std::vector<Eigen::Vector3d> source = frame;
+    TransformPoints(initial_guess, source);
+
+    Sophus::SE3d correction;
+    constexpr int kMinCorrespondences = 10;
+    for (int iteration = 0; iteration < max_num_iterations_; ++iteration) {
+        int correspondence_count = 0;
+        const auto &[JTJ, JTr] = BuildPlaneLinearSystem(source, voxel_map, max_distance,
+                                                        kernel_scale, correspondence_count);
+        if (correspondence_count < kMinCorrespondences) {
+            break;
+        }
+        Eigen::Matrix6d normal_equations = JTJ;
+        normal_equations.diagonal().array() += 1e-6;
+        const Eigen::Vector6d dx = normal_equations.ldlt().solve(-JTr);
+        const Sophus::SE3d estimation = Sophus::SE3d::exp(dx);
+        TransformPoints(estimation, source);
+        correction = estimation * correction;
+        iteration_number = static_cast<double>(iteration + 1);
+        if (dx.norm() < convergence_criterion_) {
+            break;
+        }
+    }
+    result.correction = correction;
+    result.pose = correction * initial_guess;
+    return result;
 }
 
 }  // namespace kiss_icp

@@ -30,6 +30,11 @@
 
 namespace kiss_icp {
 
+struct PlaneAlignResult {
+    Sophus::SE3d pose;
+    Sophus::SE3d correction;
+};
+
 struct Registration {
     explicit Registration(int max_num_iteration, double convergence_criterion, int max_num_threads);
 
@@ -39,6 +44,15 @@ struct Registration {
                                   const double max_correspondence_distance,
                                   const double kernel_scale,
                                   double &iteration_number);
+
+    /// Point-to-plane alignment. pose = correction * initial_guess.
+    /// The caller supplies the guess. This does not use a constant-velocity model.
+    PlaneAlignResult AlignPointsToPlane(const std::vector<Eigen::Vector3d> &frame,
+                                        const VoxelHashMap &voxel_map,
+                                        const Sophus::SE3d &initial_guess,
+                                        double max_correspondence_distance,
+                                        double kernel_scale,
+                                        double &iteration_number);
 
     int max_num_iterations_;
     double convergence_criterion_;

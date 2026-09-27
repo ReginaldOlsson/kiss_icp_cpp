@@ -53,8 +53,10 @@ include(cmake/CompilerOptions.cmake)
 add_library(kiss_icp_cpp SHARED src/core/Registration.cpp src/core/VoxelHashMap.cpp src/core/VoxelUtils.cpp
                                 src/core/Preprocessing.cpp src/core/Threshold.cpp src/pipeline/KissICP.cpp)
 # Proper public include interface
-target_include_directories(kiss_icp_cpp PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/kiss_icp_cpp>
-                                               $<INSTALL_INTERFACE:include/kiss_icp_cpp>)
+target_include_directories(
+  kiss_icp_cpp PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/kiss_icp_cpp>
+                      $<INSTALL_INTERFACE:include> $<INSTALL_INTERFACE:include/kiss_icp_cpp>)
 target_link_libraries(kiss_icp_cpp PRIVATE Eigen3::Eigen tsl::robin_map TBB::tbb Sophus::Sophus)
 
 add_subdirectory(src/metrics)
