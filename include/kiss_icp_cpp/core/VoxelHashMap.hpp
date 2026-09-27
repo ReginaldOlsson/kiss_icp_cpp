@@ -50,6 +50,14 @@ struct VoxelHashMap {
     std::vector<Eigen::Vector3d> Pointcloud() const;
     std::tuple<Eigen::Vector3d, double> GetClosestNeighbor(const Eigen::Vector3d &query) const;
     std::vector<Eigen::Vector3d> Neighbors(const Eigen::Vector3d &query, int max_neighbors) const;
+    /// Same as Neighbors, writing into a reusable buffer.
+    void CollectNeighbors(const Eigen::Vector3d &query,
+                          int max_neighbors,
+                          std::vector<Eigen::Vector3d> &neighbors) const;
+    /// Drop voxels whose first point falls outside the sensor-frame XY box. Z is unlimited.
+    void RemovePointsOutsideBox(const Sophus::SE3d &world_to_sensor,
+                                double half_longitudinal,
+                                double half_lateral);
 
     double voxel_size_;
     double max_distance_;

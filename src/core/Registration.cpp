@@ -204,53 +204,113 @@ bool EstimatePlane(const std::vector<Eigen::Vector3d> &neighbors, Eigen::Vector3
     return true;
 }
 
-LinearSystem BuildPlaneLinearSystem(const std::vector<Eigen::Vector3d> &source,
-                                    const kiss_icp::VoxelHashMap &voxel_map,
-                                    const double max_distance,
-                                    const double kernel_scale,
-                                    int &correspondence_count) {
+struct PlaneAccumulation {
+    Eigen::Matrix6d JTJ = Eigen::Matrix6d::Zero();
+    Eigen::Vector6d JTr = Eigen::Vector6d::Zero();
+    int correspondence_count = 0;
+};
+
+void AccumulatePlanePoint(PlaneAccumulation &accumulation,
+                          const Eigen::Vector3d &point_body,
+                          const Sophus::SE3d &pose,
+                          const kiss_icp::VoxelHashMap &voxel_map,
+                          const double max_distance,
+                          const double kernel_scale,
+                          std::vector<Eigen::Vector3d> &neighbors) {
     constexpr int kNeighborCount = 20;
-    LinearSystem system(Eigen::Matrix6d::Zero(), Eigen::Vector6d::Zero());
-    correspondence_count = 0;
+    const Eigen::Vector3d point_world = pose * point_body;
+    voxel_map.CollectNeighbors(point_world, kNeighborCount, neighbors);
+    if (neighbors.empty()) {
+        return;
+    }
+    const auto closest = std::min_element(
+        neighbors.cbegin(), neighbors.cend(),
+        [&](const Eigen::Vector3d &lhs, const Eigen::Vector3d &rhs) {
+            return (lhs - point_world).squaredNorm() < (rhs - point_world).squaredNorm();
+        });
+    if ((*closest - point_world).norm() >= max_distance) {
+        return;
+    }
+
+    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+    if (!EstimatePlane(neighbors, normal)) {
+        return;
+    }
+    ++accumulation.correspondence_count;
+    const Eigen::Vector3d normal_body = pose.so3().inverse() * normal;
+    const double residual = normal.dot(point_world - *closest);
+    Eigen::Matrix<double, 1, 6> jacobian;
+    jacobian.block<1, 3>(0, 0) = normal_body.transpose();
+    jacobian.block<1, 3>(0, 3) = point_body.cross(normal_body).transpose();
     const double kernel2 = square(kernel_scale);
+    const double weight = kernel2 / square(kernel_scale + residual * residual);
+    accumulation.JTJ += jacobian.transpose() * weight * jacobian;
+    accumulation.JTr += jacobian.transpose() * weight * residual;
+}
 
-    for (const auto &point : source) {
-        const auto neighbors = voxel_map.Neighbors(point, kNeighborCount);
-        if (neighbors.empty()) {
-            continue;
-        }
-        const auto closest =
-            std::min_element(neighbors.cbegin(), neighbors.cend(),
-                             [&](const Eigen::Vector3d &lhs, const Eigen::Vector3d &rhs) {
-                                 return (lhs - point).squaredNorm() < (rhs - point).squaredNorm();
-                             });
-        const double distance = (*closest - point).norm();
-        if (distance >= max_distance) {
-            continue;
-        }
-
-        Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-        const bool planar = EstimatePlane(neighbors, normal);
-        ++correspondence_count;
-        if (planar) {
-            const double residual = normal.dot(point - *closest);
-            Eigen::Matrix<double, 1, 6> jacobian;
-            jacobian.block<1, 3>(0, 0) = normal.transpose();
-            jacobian.block<1, 3>(0, 3) = point.cross(normal).transpose();
-            const double weight = kernel2 / square(kernel_scale + residual * residual);
-            system.first += jacobian.transpose() * weight * jacobian;
-            system.second += jacobian.transpose() * weight * residual;
-        } else {
-            const Eigen::Vector3d residual = point - *closest;
-            Eigen::Matrix3_6d jacobian;
-            jacobian.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
-            jacobian.block<3, 3>(0, 3) = -1.0 * Sophus::SO3d::hat(point);
-            const double weight = kernel2 / square(kernel_scale + residual.squaredNorm());
-            system.first += jacobian.transpose() * weight * jacobian;
-            system.second += jacobian.transpose() * weight * residual;
+bool SolveBodyIncrement(const PlaneAccumulation &accumulation, Eigen::Vector6d &dx) {
+    constexpr double kDegeneracyRatio = 1e-3;
+    constexpr double kDamping = 1e-6;
+    const Eigen::Matrix6d &hessian = accumulation.JTJ;
+    Eigen::Vector6d scale = hessian.diagonal().cwiseAbs().cwiseSqrt();
+    for (int axis = 0; axis < 6; ++axis) {
+        if (scale(axis) < 1e-9) {
+            scale(axis) = 1.0;
         }
     }
-    return system;
+
+    Eigen::Matrix6d hessian_normalized = hessian;
+    Eigen::Vector6d gradient = accumulation.JTr;
+    for (int row = 0; row < 6; ++row) {
+        gradient(row) /= scale(row);
+        for (int column = 0; column < 6; ++column) {
+            hessian_normalized(row, column) /= scale(row) * scale(column);
+        }
+    }
+
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix6d> eigen_solver(hessian_normalized);
+    if (eigen_solver.info() != Eigen::Success) {
+        return false;
+    }
+    const double lambda_max = eigen_solver.eigenvalues()(5);
+    Eigen::Vector6d y = Eigen::Vector6d::Zero();
+    if (lambda_max > 0.0) {
+        for (int axis = 0; axis < 6; ++axis) {
+            const double lambda = eigen_solver.eigenvalues()(axis);
+            if (lambda < kDegeneracyRatio * lambda_max) {
+                continue;
+            }
+            const Eigen::Vector6d direction = eigen_solver.eigenvectors().col(axis);
+            y -= direction * (direction.dot(gradient) / (lambda + kDamping));
+        }
+    }
+    dx = y.cwiseQuotient(scale);
+    return dx.allFinite();
+}
+
+PlaneAccumulation BuildPlaneLinearSystem(const std::vector<Eigen::Vector3d> &frame,
+                                         const Sophus::SE3d &pose,
+                                         const kiss_icp::VoxelHashMap &voxel_map,
+                                         const double max_distance,
+                                         const double kernel_scale) {
+    auto join = [](PlaneAccumulation left, const PlaneAccumulation &right) {
+        left.JTJ += right.JTJ;
+        left.JTr += right.JTr;
+        left.correspondence_count += right.correspondence_count;
+        return left;
+    };
+    return tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>{0, frame.size()}, PlaneAccumulation{},
+        [&](const tbb::blocked_range<std::size_t> &range, PlaneAccumulation accumulation) {
+            std::vector<Eigen::Vector3d> neighbors;
+            neighbors.reserve(128);
+            for (std::size_t index = range.begin(); index < range.end(); ++index) {
+                AccumulatePlanePoint(accumulation, frame[index], pose, voxel_map, max_distance,
+                                     kernel_scale, neighbors);
+            }
+            return accumulation;
+        },
+        join);
 }
 
 }  // namespace
@@ -269,31 +329,35 @@ PlaneAlignResult Registration::AlignPointsToPlane(const std::vector<Eigen::Vecto
         return result;
     }
 
-    std::vector<Eigen::Vector3d> source = frame;
-    TransformPoints(initial_guess, source);
-
-    Sophus::SE3d correction;
+    // Right-multiply the increment so rotation is about the vehicle, not the map origin.
+    Sophus::SE3d pose = initial_guess;
     constexpr int kMinCorrespondences = 10;
+    constexpr double kMaxStepTranslation = 0.5;
+    constexpr double kMaxStepRotation = 0.2;
     for (int iteration = 0; iteration < max_num_iterations_; ++iteration) {
-        int correspondence_count = 0;
-        const auto &[JTJ, JTr] = BuildPlaneLinearSystem(source, voxel_map, max_distance,
-                                                        kernel_scale, correspondence_count);
-        if (correspondence_count < kMinCorrespondences) {
+        const PlaneAccumulation accumulation =
+            BuildPlaneLinearSystem(frame, pose, voxel_map, max_distance, kernel_scale);
+        if (accumulation.correspondence_count < kMinCorrespondences) {
             break;
         }
-        Eigen::Matrix6d normal_equations = JTJ;
-        normal_equations.diagonal().array() += 1e-6;
-        const Eigen::Vector6d dx = normal_equations.ldlt().solve(-JTr);
-        const Sophus::SE3d estimation = Sophus::SE3d::exp(dx);
-        TransformPoints(estimation, source);
-        correction = estimation * correction;
+        Eigen::Vector6d dx = Eigen::Vector6d::Zero();
+        if (!SolveBodyIncrement(accumulation, dx)) {
+            break;
+        }
+        if (dx.head<3>().norm() > kMaxStepTranslation) {
+            dx.head<3>() *= kMaxStepTranslation / dx.head<3>().norm();
+        }
+        if (dx.tail<3>().norm() > kMaxStepRotation) {
+            dx.tail<3>() *= kMaxStepRotation / dx.tail<3>().norm();
+        }
+        pose = pose * Sophus::SE3d::exp(dx);
         iteration_number = static_cast<double>(iteration + 1);
         if (dx.norm() < convergence_criterion_) {
             break;
         }
     }
-    result.correction = correction;
-    result.pose = correction * initial_guess;
+    result.pose = pose;
+    result.correction = pose * initial_guess.inverse();
     return result;
 }
 

@@ -25,6 +25,7 @@
 #include <Eigen/Core>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <sophus/se3.hpp>
 #include <vector>
@@ -70,11 +71,12 @@ std::tuple<Eigen::Vector3d, double> VoxelHashMap::GetClosestNeighbor(
     return std::make_tuple(closest_neighbor, closest_distance);
 }
 
-std::vector<Eigen::Vector3d> VoxelHashMap::Neighbors(const Eigen::Vector3d &query,
-                                                     const int max_neighbors) const {
-    std::vector<Eigen::Vector3d> candidates;
+void VoxelHashMap::CollectNeighbors(const Eigen::Vector3d &query,
+                                    const int max_neighbors,
+                                    std::vector<Eigen::Vector3d> &neighbors) const {
+    neighbors.clear();
     if (max_neighbors <= 0) {
-        return candidates;
+        return;
     }
     const auto &voxel = PointToVoxel(query, voxel_size_);
     std::for_each(voxel_shifts.cbegin(), voxel_shifts.cend(), [&](const auto &voxel_shift) {
@@ -82,19 +84,25 @@ std::vector<Eigen::Vector3d> VoxelHashMap::Neighbors(const Eigen::Vector3d &quer
         const auto search = map_.find(query_voxel);
         if (search != map_.end()) {
             const auto &points = search.value();
-            candidates.insert(candidates.end(), points.cbegin(), points.cend());
+            neighbors.insert(neighbors.end(), points.cbegin(), points.cend());
         }
     });
-    if (static_cast<int>(candidates.size()) <= max_neighbors) {
-        return candidates;
+    if (static_cast<int>(neighbors.size()) <= max_neighbors) {
+        return;
     }
-    const auto middle = candidates.begin() + static_cast<std::ptrdiff_t>(max_neighbors);
-    std::nth_element(candidates.begin(), middle, candidates.end(),
+    const auto middle = neighbors.begin() + static_cast<std::ptrdiff_t>(max_neighbors);
+    std::nth_element(neighbors.begin(), middle, neighbors.end(),
                      [&](const Eigen::Vector3d &lhs, const Eigen::Vector3d &rhs) {
                          return (lhs - query).squaredNorm() < (rhs - query).squaredNorm();
                      });
-    candidates.resize(static_cast<std::size_t>(max_neighbors));
-    return candidates;
+    neighbors.resize(static_cast<std::size_t>(max_neighbors));
+}
+
+std::vector<Eigen::Vector3d> VoxelHashMap::Neighbors(const Eigen::Vector3d &query,
+                                                     const int max_neighbors) const {
+    std::vector<Eigen::Vector3d> neighbors;
+    CollectNeighbors(query, max_neighbors, neighbors);
+    return neighbors;
 }
 
 std::vector<Eigen::Vector3d> VoxelHashMap::Pointcloud() const {
@@ -152,6 +160,19 @@ void VoxelHashMap::RemovePointsFarFromLocation(const Eigen::Vector3d &origin) {
         const auto &[voxel, voxel_points] = *it;
         const auto &pt = voxel_points.front();
         if ((pt - origin).squaredNorm() >= (max_distance2)) {
+            it = map_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void VoxelHashMap::RemovePointsOutsideBox(const Sophus::SE3d &world_to_sensor,
+                                          const double half_longitudinal,
+                                          const double half_lateral) {
+    for (auto it = map_.begin(); it != map_.end();) {
+        const Eigen::Vector3d local = world_to_sensor * it.value().front();
+        if (std::abs(local.x()) > half_longitudinal || std::abs(local.y()) > half_lateral) {
             it = map_.erase(it);
         } else {
             ++it;
