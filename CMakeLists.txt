@@ -31,6 +31,21 @@ option(USE_SYSTEM_EIGEN3 "Use system pre-installed Eigen" ON)
 option(USE_SYSTEM_SOPHUS "Use system pre-installed Sophus" ON)
 option(USE_SYSTEM_TSL-ROBIN-MAP "Use system pre-installed tsl_robin" ON)
 option(USE_SYSTEM_TBB "Use system pre-installed oneAPI/tbb" ON)
+option(KISS_ICP_ENABLE_SIMD "Compile with native SIMD and 32-byte Eigen alignment" ON)
+
+if(KISS_ICP_ENABLE_SIMD)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64)$")
+    set(KISS_ICP_SIMD_FLAGS -march=native -mtune=native)
+  else()
+    set(KISS_ICP_SIMD_FLAGS)
+    message(WARNING "KISS_ICP_ENABLE_SIMD is ON but no SIMD flags are known for ${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+  # Force 32-byte Eigen ABI so AVX consumers (e.g. back_odom) can share Vector3d layouts.
+  set(KISS_ICP_SIMD_DEFINES EIGEN_MAX_ALIGN_BYTES=32 EIGEN_MAX_STATIC_ALIGN_BYTES=32)
+  if(KISS_ICP_SIMD_FLAGS)
+    message(STATUS "kiss_icp_cpp SIMD enabled: ${KISS_ICP_SIMD_FLAGS}; Eigen align=32")
+  endif()
+endif()
 
 # # ccache setup
 if(USE_CCACHE)
@@ -58,6 +73,13 @@ target_include_directories(
                       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/kiss_icp_cpp>
                       $<INSTALL_INTERFACE:include> $<INSTALL_INTERFACE:include/kiss_icp_cpp>)
 target_link_libraries(kiss_icp_cpp PRIVATE Eigen3::Eigen tsl::robin_map TBB::tbb Sophus::Sophus)
+if(KISS_ICP_ENABLE_SIMD)
+  if(KISS_ICP_SIMD_FLAGS)
+    target_compile_options(kiss_icp_cpp PRIVATE ${KISS_ICP_SIMD_FLAGS})
+  endif()
+  # PUBLIC so dependents compile against the same Eigen ABI.
+  target_compile_definitions(kiss_icp_cpp PUBLIC ${KISS_ICP_SIMD_DEFINES})
+endif()
 
 add_subdirectory(src/metrics)
 
