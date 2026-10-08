@@ -26,6 +26,8 @@
 #include <sophus/se3.hpp>
 #include <vector>
 
+#include <chrono>
+
 #include "kiss_icp_cpp/core/VoxelHashMap.hpp"
 
 namespace kiss_icp {
@@ -33,6 +35,10 @@ namespace kiss_icp {
 struct PlaneAlignResult {
     Sophus::SE3d pose;
     Sophus::SE3d correction;
+    /// Plane correspondences used in the last linear system (0 when no iteration ran).
+    int correspondences{0};
+    /// Norm of the last body increment. Small values mean the partial solve had settled.
+    double last_step{0.0};
 };
 
 struct Registration {
@@ -47,12 +53,14 @@ struct Registration {
 
     /// Point-to-plane alignment. pose = correction * initial_guess.
     /// The caller supplies the guess. This does not use a constant-velocity model.
-    PlaneAlignResult AlignPointsToPlane(const std::vector<Eigen::Vector3d> &frame,
-                                        const VoxelHashMap &voxel_map,
-                                        const Sophus::SE3d &initial_guess,
-                                        double max_correspondence_distance,
-                                        double kernel_scale,
-                                        double &iteration_number);
+    /// When `deadline` is reached mid-loop, iteration stops, `timed_out` is set, and the pose
+    /// reached so far is returned (iteration_number tells how many steps it had).
+    PlaneAlignResult AlignPointsToPlane(
+        const std::vector<Eigen::Vector3d> &frame, const VoxelHashMap &voxel_map,
+        const Sophus::SE3d &initial_guess, double max_correspondence_distance, double kernel_scale,
+        double &iteration_number,
+        const std::chrono::steady_clock::time_point *deadline = nullptr,
+        bool *timed_out = nullptr);
 
     int max_num_iterations_;
     double convergence_criterion_;

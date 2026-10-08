@@ -32,6 +32,7 @@
 
 #include <Eigen/Eigenvalues>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <sophus/se3.hpp>
@@ -315,17 +316,28 @@ PlaneAccumulation BuildPlaneLinearSystem(const std::vector<Eigen::Vector3d> &fra
 
 }  // namespace
 
-PlaneAlignResult Registration::AlignPointsToPlane(const std::vector<Eigen::Vector3d> &frame,
-                                                  const VoxelHashMap &voxel_map,
-                                                  const Sophus::SE3d &initial_guess,
-                                                  const double max_distance,
-                                                  const double kernel_scale,
-                                                  double &iteration_number) {
+PlaneAlignResult Registration::AlignPointsToPlane(
+    const std::vector<Eigen::Vector3d> &frame, const VoxelHashMap &voxel_map,
+    const Sophus::SE3d &initial_guess, const double max_distance, const double kernel_scale,
+    double &iteration_number, const std::chrono::steady_clock::time_point *deadline,
+    bool *timed_out) {
     PlaneAlignResult result;
     result.pose = initial_guess;
     result.correction = Sophus::SE3d();
     iteration_number = 0.0;
+    if (timed_out != nullptr) {
+        *timed_out = false;
+    }
     if (voxel_map.Empty() || frame.empty() || kernel_scale <= 0.0) {
+        return result;
+    }
+    const auto past_deadline = [deadline]() {
+        return deadline != nullptr && std::chrono::steady_clock::now() >= *deadline;
+    };
+    if (past_deadline()) {
+        if (timed_out != nullptr) {
+            *timed_out = true;
+        }
         return result;
     }
 
@@ -335,8 +347,17 @@ PlaneAlignResult Registration::AlignPointsToPlane(const std::vector<Eigen::Vecto
     constexpr double kMaxStepTranslation = 0.5;
     constexpr double kMaxStepRotation = 0.2;
     for (int iteration = 0; iteration < max_num_iterations_; ++iteration) {
+        if (past_deadline()) {
+            // Keep the partial solve. The caller decides from iteration_number / last_step
+            // whether it had settled enough to use.
+            if (timed_out != nullptr) {
+                *timed_out = true;
+            }
+            break;
+        }
         const PlaneAccumulation accumulation =
             BuildPlaneLinearSystem(frame, pose, voxel_map, max_distance, kernel_scale);
+        result.correspondences = accumulation.correspondence_count;
         if (accumulation.correspondence_count < kMinCorrespondences) {
             break;
         }
@@ -352,6 +373,7 @@ PlaneAlignResult Registration::AlignPointsToPlane(const std::vector<Eigen::Vecto
         }
         pose = pose * Sophus::SE3d::exp(dx);
         iteration_number = static_cast<double>(iteration + 1);
+        result.last_step = dx.norm();
         if (dx.norm() < convergence_criterion_) {
             break;
         }
