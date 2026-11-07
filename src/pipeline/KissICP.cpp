@@ -22,7 +22,6 @@
 // SOFTWARE.
 
 #include <Eigen/Core>
-#include <iostream>
 #include <vector>
 
 #include "kiss_icp_cpp/core/Preprocessing.hpp"
@@ -40,7 +39,7 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrameWithoudLocalMapupdate(
     const auto &preprocessed_frame = preprocessor_.Preprocess(frame, timestamps, last_delta_);
 
     // Voxelize
-    const auto &[source, frame_downsample] = Voxelize(preprocessed_frame);
+    const auto source = std::get<0>(Voxelize(preprocessed_frame));
 
     // Get adaptive_threshold
     const double sigma = adaptive_threshold_.ComputeThreshold();
@@ -116,7 +115,5 @@ KissICP::Vector3dVectorTuple KissICP::Voxelize(const std::vector<Eigen::Vector3d
     const auto source = kiss_icp::VoxelDownsample(frame_downsample, voxel_size * 1.5);
     return {source, frame_downsample};
 }
-
-void KissICP::test_function() { std::cout << "test functino" << std::endl; }
 
 }  // namespace kiss_icp::pipeline

@@ -32,7 +32,6 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <algorithm>
-#include <functional>
 #include <vector>
 
 namespace kiss_icp {
